@@ -1,3 +1,4 @@
+[README.md](https://github.com/user-attachments/files/32208289/README.md)
 # Daily Commodities Report
 
 Sends you a tiered HTML email every weekday morning: headline movers (WTI, Brent,
@@ -9,19 +10,31 @@ watch section when EIA releases weekly stockpile data.
 - **EIA API key** (energy prices + inventory data): https://www.eia.gov/opendata/register.php — instant, free, no approval wait.
 - **Alpha Vantage API key** (metals + ag): https://www.alphavantage.co/support/#api-key — instant, free tier is 25 requests/day, which is enough for this script (it makes ~9 calls per run).
 
-## 2. Get SMTP credentials
+## 2. Get a free Metals-API key (for Gold/Silver/Platinum/Palladium)
+
+Sign up free at https://metals-api.com/ — Alpha Vantage does not offer precious
+metals data on any tier despite XAU/XAG/XPT/XPD looking like currency codes,
+so this is a separate provider just for those four. Free tier is limited
+(historically ~50 requests/month); the script uses 1 call per metal per
+weekday run, so keep an eye on your usage dashboard. If the historical
+"timeframe" endpoint isn't available on your plan, the script automatically
+falls back to showing just the current price with no chart or change — it
+won't crash the whole report.
+
+## 3. Get SMTP credentials
 
 Any of these work:
 - **Gmail**: use an [App Password](https://myaccount.google.com/apppasswords) (not your regular password). Host: `smtp.gmail.com`, Port: `587`.
 - **Resend** (https://resend.com) or **SendGrid** (https://sendgrid.com): both have free tiers and give you SMTP credentials in their dashboard — often more reliable for automated sending than a personal Gmail account.
 
-## 3. Run it locally to test
+## 4. Run it locally to test
 
 ```bash
 pip install -r requirements.txt
 
 export EIA_API_KEY="your_key"
 export ALPHAVANTAGE_API_KEY="your_key"
+export METALS_API_KEY="your_key"
 export SMTP_HOST="smtp.gmail.com"
 export SMTP_PORT="587"
 export SMTP_USER="you@gmail.com"
@@ -35,11 +48,12 @@ python commodities_report.py
 Check your inbox. If something's missing, check the console — the script logs a
 warning per commodity that fails to fetch instead of crashing the whole report.
 
-## 4. Automate it with GitHub Actions (free, no server needed)
+## 5. Automate it with GitHub Actions (free, no server needed)
 
 1. Push this folder to a new **private** GitHub repo.
 2. In the repo, go to **Settings → Secrets and variables → Actions** and add each
-   of the environment variables above as a secret (same names).
+   of the environment variables above (including `METALS_API_KEY`) as a secret
+   (same names).
 3. The workflow in `.github/workflows/daily-report.yml` is set to run weekdays at
    7am ET. Adjust the `cron` line if you want a different time — GitHub Actions
    cron schedules are always in UTC.
