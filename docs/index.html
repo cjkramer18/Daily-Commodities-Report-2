@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Commodities Dashboard</title>
+<style>
+  :root { --border:#e1e0d9; --text-secondary:#52514e; --text-muted:#898781; --bg-accent:#e6f1fb; --text-accent:#185fa5; --border-accent:#378add; }
+  body { font-family: -apple-system, Arial, sans-serif; max-width: 900px; margin: 0 auto; padding: 24px 16px; color: #1a1a1a; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  #updated { color: var(--text-muted); font-size: 13px; margin-bottom: 24px; }
+  select { padding: 6px 10px; font-size: 14px; border: 0.5px solid var(--border); border-radius: 6px; margin-bottom: 12px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; margin-bottom: 16px; }
+  .tf-btn { font-size: 13px; padding: 5px 12px; border: 0.5px solid var(--border); background: white; border-radius: 6px; cursor: pointer; }
+  .tf-btn.active { background: var(--bg-accent); color: var(--text-accent); border-color: var(--border-accent); }
+  .ma-toggles { display: flex; gap: 14px; font-size: 13px; color: var(--text-secondary); flex-wrap: wrap; }
+  .ma-toggles label { display: flex; align-items: center; gap: 5px; }
+  #chartWrap { position: relative; height: 420px; margin-top: 12px; }
+  #note { font-size: 12px; color: var(--text-muted); margin-top: 12px; }
+</style>
+</head>
+<body>
+<h1>Commodities Dashboard</h1>
+<p id="updated">Loading…</p>
+
+<div class="controls">
+  <select id="commoditySelect"></select>
+  <div id="tfGroup"></div>
+</div>
+<div class="ma-toggles">
+  <label><input type="checkbox" id="ma200" /> 200-day SMA</label>
+  <label><input type="checkbox" id="ma50" /> 50-day SMA</label>
+  <label><input type="checkbox" id="ma20" /> 20-day SMA</label>
+  <label><input type="checkbox" id="ema10" /> 10-day EMA</label>
+</div>
+
+<div id="chartWrap">
+  <canvas id="mainChart" role="img" aria-label="Commodity price chart with selectable timeframe and moving averages"></canvas>
+</div>
+<p id="note"></p>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+const TIMEFRAMES = { '1M': 30, '3M': 90, '6M': 182, 'YTD': 'ytd', '1Y': 365, '5Y': 1825 };
+let allData = null;
+let currentSeries = null;
+let currentTf = '3M';
+let chart = null;
+
+function sma(values, window) {
+  return values.map((_, i) => {
+    if (i < window - 1) return null;
+    const slice = values.slice(i - window + 1, i + 1);
+    return slice.reduce((a, b) => a + b, 0) / window;
+  });
+}
+
+function ema(values, window) {
+  const k = 2 / (window + 1);
+  const out = [];
+  let prev = null;
+  values.forEach((v, i) => {
+    if (i < window - 1) { out.push(null); return; }
+    if (prev === null) {
+      const slice = values.slice(0, window);
+      prev = slice.reduce((a, b) => a + b, 0) / window;
+    } else {
+      prev = v * k + prev * (1 - k);
+    }
+    out.push(prev);
+  });
+  return out;
+}
+
+function filterByTimeframe(points, tf) {
+  if (tf === 'ytd') {
+    const year = new Date().getFullYear();
+    return points.filter(p => p.date.startsWith(String(year)));
+  }
+  const days = TIMEFRAMES[tf];
+  return points.slice(-days);
+}
+
+function render() {
+  const points = allData.series[currentSeries] || [];
+  const windowed = filterByTimeframe(points, currentTf);
+  const labels = windowed.map(p => p.date);
+  const prices = windowed.map(p => p.price);
+
+  const datasets = [
+    { label: 'Price', data: prices, borderColor: '#2a78d6', borderWidth: 2, pointRadius: 0, tension: 0.15 }
+  ];
+
+  // Moving averages are computed over the FULL series (not just the visible
+  // window) so a 200-day SMA is correct even when viewing a 1M timeframe,
+  // then sliced back down to the visible window.
+  const fullPrices = points.map(p => p.price);
+  const sliceStart = points.length - windowed.length;
+
+  function addMA(id, fn, window, color, dash) {
+    if (!document.getElementById(id).checked) return;
+    if (fullPrices.length < window) return; // not enough history yet
+    const full = fn(fullPrices, window);
+    const sliced = full.slice(sliceStart);
+    datasets.push({ label: `${window}-period MA`, data: sliced, borderColor: color, borderWidth: 1.5, borderDash: dash, pointRadius: 0, tension: 0.15 });
+  }
+  addMA('ma200', sma, 200, '#e34948', [2,2]);
+  addMA('ma50', sma, 50, '#eda100', [4,3]);
+  addMA('ma20', sma, 20, '#1baf7a', [6,3]);
+  addMA('ema10', ema, 10, '#6250d6', [1,2]);
+
+  if (chart) chart.destroy();
+  chart = new Chart(document.getElementById('mainChart'), {
+    type: 'line',
+    data: { labels, datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: true, position: 'top', labels: { boxWidth: 10, font: { size: 11 } } } },
+      scales: {
+        x: { ticks: { maxTicksLimit: 8, color: '#898781', font: { size: 10 } }, grid: { display: false } },
+        y: { ticks: { color: '#898781', font: { size: 10 } }, grid: { color: '#e1e0d9' } }
+      }
+    }
+  });
+
+  const note = document.getElementById('note');
+  if (fullPrices.length < 200) {
+    note.textContent = `This series has ${fullPrices.length} days of history so far — the 200-day moving average will appear once enough history has accumulated.`;
+  } else {
+    note.textContent = '';
+  }
+}
+
+function buildControls() {
+  const select = document.getElementById('commoditySelect');
+  Object.keys(allData.series).forEach(name => {
+    const opt = document.createElement('option');
+    opt.value = name; opt.textContent = name;
+    select.appendChild(opt);
+  });
+  currentSeries = Object.keys(allData.series)[0];
+  select.value = currentSeries;
+  select.addEventListener('change', () => { currentSeries = select.value; render(); });
+
+  const tfGroup = document.getElementById('tfGroup');
+  Object.keys(TIMEFRAMES).forEach(tf => {
+    const btn = document.createElement('button');
+    btn.className = 'tf-btn' + (tf === currentTf ? ' active' : '');
+    btn.textContent = tf;
+    btn.onclick = () => {
+      currentTf = tf;
+      document.querySelectorAll('.tf-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      render();
+    };
+    tfGroup.appendChild(btn);
+  });
+
+  ['ma200','ma50','ma20','ema10'].forEach(id => {
+    document.getElementById(id).addEventListener('change', render);
+  });
+}
+
+fetch('data/price_history.json')
+  .then(r => r.json())
+  .then(data => {
+    allData = data;
+    document.getElementById('updated').textContent = 'Updated ' + new Date(data.generated_at).toLocaleString();
+    buildControls();
+    render();
+  })
+  .catch(err => {
+    document.getElementById('updated').textContent = 'Could not load price data — the daily workflow may not have run yet.';
+    console.error(err);
+  });
+</script>
+</body>
+</html>
