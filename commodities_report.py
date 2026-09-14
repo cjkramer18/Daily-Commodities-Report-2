@@ -13,11 +13,12 @@ Data sources:
     resolution on Alpha Vantage — there is no daily data available for
     them at any tier. The "change" shown for these is month-over-month,
     not day-over-day, and is labeled as such in the email.
-  - Metals-API (free tier): Gold (XAU), Silver (XAG), Platinum (XPT),
-    Palladium (XPD). Alpha Vantage does not offer precious metals data
-    on the free tier (or possibly any tier) — its forex endpoint only
-    covers real currency pairs, not metals, despite XAU/XAG/XPT/XPD
-    looking like currency codes. Metals-API is a dedicated provider.
+  - Metals.Dev (free tier, no credit card): Gold, Silver, Platinum,
+    Palladium. Alpha Vantage does not offer precious metals data on the
+    free tier (or possibly any tier) — its forex endpoint only covers
+    real currency pairs, not metals, despite XAU/XAG/XPT/XPD looking
+    like currency codes. Metals.Dev's timeseries endpoint conveniently
+    returns all four metals for a date range in a single API call.
 
 Note: Alpha Vantage doesn't cover Soybeans or Steel at all. Those stay
 "N/A" — plug in a paid source (Nasdaq Data Link / Trading Economics) if
@@ -26,7 +27,7 @@ you want them.
 Environment variables required (see README.md for how to get each):
   EIA_API_KEY            - free, from https://www.eia.gov/opendata/register.php
   ALPHAVANTAGE_API_KEY   - free, from https://www.alphavantage.co/support/#api-key
-  METALS_API_KEY         - free, from https://metals-api.com/
+  METALS_API_KEY         - free, from https://metals.dev/ (sign up, no credit card needed)
   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD  - your email provider's SMTP creds
   REPORT_TO_EMAIL        - where the report gets sent
   REPORT_FROM_EMAIL      - the "from" address (often same as SMTP_USER)
@@ -70,12 +71,12 @@ AV_THROTTLE_SECONDS = 13
 COMMODITIES = [
     {"name": "WTI Crude",     "tier": 1, "source": "eia",       "series_id": "PET.RWTC.D", "resolution": "daily"},
     {"name": "Brent Crude",   "tier": 1, "source": "eia",       "series_id": "PET.RBRTE.D", "resolution": "daily"},
-    {"name": "Gold",          "tier": 1, "source": "metals",    "symbol": "XAU", "resolution": "daily"},
+    {"name": "Gold",          "tier": 1, "source": "metals_dev", "resolution": "daily"},
     {"name": "Copper",        "tier": 1, "source": "av_commod", "function": "COPPER", "resolution": "monthly"},
     {"name": "Natural Gas",   "tier": 2, "source": "eia",       "series_id": "NG.RNGWHHD.D", "resolution": "daily"},
-    {"name": "Silver",        "tier": 2, "source": "metals",    "symbol": "XAG", "resolution": "daily"},
-    {"name": "Platinum",      "tier": 2, "source": "metals",    "symbol": "XPT", "resolution": "daily"},
-    {"name": "Palladium",     "tier": 2, "source": "metals",    "symbol": "XPD", "resolution": "daily"},
+    {"name": "Silver",        "tier": 2, "source": "metals_dev", "resolution": "daily"},
+    {"name": "Platinum",      "tier": 2, "source": "metals_dev", "resolution": "daily"},
+    {"name": "Palladium",     "tier": 2, "source": "metals_dev", "resolution": "daily"},
     {"name": "Aluminum",      "tier": 2, "source": "av_commod", "function": "ALUMINUM", "resolution": "monthly"},
     {"name": "Steel",         "tier": 2, "source": "none"},
     {"name": "Corn",          "tier": 2, "source": "av_commod", "function": "CORN", "resolution": "monthly"},
@@ -172,50 +173,43 @@ def fetch_av_commodity(function):
     return {"price": latest, "change": change, "pct_change": pct_change, "history": history}
 
 
-def fetch_metals(symbol):
-    """Precious metals via Metals-API. Tries a 14-day timeframe call first
-    (gives both the chart and a real day-over-day change in one request);
-    falls back to a single /latest call (current price only, no chart or
-    change) if the timeframe endpoint isn't available on the current plan."""
+def fetch_metals_dev_batch():
+    """One call to Metals.Dev's timeseries endpoint returns Gold, Silver,
+    Platinum, and Palladium together for the whole date range — far more
+    efficient than fetching each metal separately."""
     today = datetime.now(ZoneInfo("America/New_York")).date()
-    start = today - timedelta(days=14)
-    url = "https://metals-api.com/api/timeframe"
+    start = today - timedelta(days=13)  # 14-day window, within their 30-day max
+    url = "https://api.metals.dev/v1/timeseries"
     params = {
-        "access_key": METALS_API_KEY,
-        "base": "USD",
-        "symbols": symbol,
+        "api_key": METALS_API_KEY,
         "start_date": start.isoformat(),
         "end_date": today.isoformat(),
     }
-    try:
-        resp = fetch_with_retry(url, params=params)
-        body = resp.json()
-        if not body.get("success"):
-            raise RuntimeError(body.get("error", {}).get("info", "timeframe call failed"))
-        rates = body["rates"]  # {date: {symbol: rate}}
-        dated_prices = []
-        for date_str in sorted(rates.keys()):
-            rate = rates[date_str].get(symbol)
-            if rate:
-                dated_prices.append((date_str, 1 / rate))
-        if len(dated_prices) < 2:
-            raise RuntimeError("Not enough historical points returned")
-        latest_date, latest = dated_prices[-1]
-        _, previous = dated_prices[-2]
+    resp = fetch_with_retry(url, params=params)
+    body = resp.json()
+    if body.get("status") != "success":
+        raise RuntimeError(body.get("error_message", "Metals.Dev request failed"))
+
+    rates = body["rates"]  # {date_str: {"metals": {"gold": .., "silver": .., ...}, ...}}
+    sorted_dates = sorted(rates.keys())
+
+    metal_keys = {"gold": "Gold", "silver": "Silver", "platinum": "Platinum", "palladium": "Palladium"}
+    out = {}
+    for metal_key, display_name in metal_keys.items():
+        history = []
+        for date_str in sorted_dates:
+            price = rates[date_str].get("metals", {}).get(metal_key)
+            if price is not None:
+                history.append((date_str, float(price)))
+        if len(history) < 2:
+            logger.warning(f"Not enough Metals.Dev history for {display_name}")
+            continue
+        latest = history[-1][1]
+        previous = history[-2][1]
         change = latest - previous
         pct_change = (change / previous) * 100 if previous else 0
-        return {"price": latest, "change": change, "pct_change": pct_change, "history": dated_prices}
-    except Exception as e:
-        logger.warning(f"Metals-API timeframe call failed for {symbol} ({e}), falling back to /latest")
-        url = "https://metals-api.com/api/latest"
-        params = {"access_key": METALS_API_KEY, "base": "USD", "symbols": symbol}
-        resp = fetch_with_retry(url, params=params)
-        body = resp.json()
-        if not body.get("success"):
-            raise RuntimeError(body.get("error", {}).get("info", "latest call failed"))
-        rate = body["rates"][symbol]
-        price = 1 / rate
-        return {"price": price, "change": 0.0, "pct_change": 0.0, "history": []}
+        out[display_name] = {"price": latest, "change": change, "pct_change": pct_change, "history": history}
+    return out
 
 
 def fetch_eia_crude_inventory():
@@ -237,8 +231,6 @@ def fetch_commodity(commodity):
             return fetch_eia_series(commodity["series_id"])
         elif source == "av_commod":
             return fetch_av_commodity(commodity["function"])
-        elif source == "metals":
-            return fetch_metals(commodity["symbol"])
         else:
             return None
     except Exception as e:
@@ -420,8 +412,17 @@ def main(dry_run=False):
     validate_environment()
 
     results = {}
+
+    # Precious metals: one batched call covers all four (Gold, Silver, Platinum, Palladium)
+    try:
+        results.update(fetch_metals_dev_batch())
+    except Exception as e:
+        logger.warning(f"Metals.Dev batch fetch failed: {e}")
+
     av_calls_made = 0
     for c in COMMODITIES:
+        if c["source"] == "metals_dev":
+            continue  # already handled above
         if c["source"] == "av_commod":
             if av_calls_made > 0:
                 time.sleep(AV_THROTTLE_SECONDS)
