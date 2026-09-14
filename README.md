@@ -1,4 +1,4 @@
-[README.md](https://github.com/user-attachments/files/32208289/README.md)
+[README (1).md](https://github.com/user-attachments/files/32208696/README.1.md)
 # Daily Commodities Report
 
 Sends you a tiered HTML email every weekday morning: headline movers (WTI, Brent,
@@ -10,16 +10,15 @@ watch section when EIA releases weekly stockpile data.
 - **EIA API key** (energy prices + inventory data): https://www.eia.gov/opendata/register.php — instant, free, no approval wait.
 - **Alpha Vantage API key** (metals + ag): https://www.alphavantage.co/support/#api-key — instant, free tier is 25 requests/day, which is enough for this script (it makes ~9 calls per run).
 
-## 2. Get a free Metals-API key (for Gold/Silver/Platinum/Palladium)
+## 2. Get a free Metals.Dev key (for Gold/Silver/Platinum/Palladium)
 
-Sign up free at https://metals-api.com/ — Alpha Vantage does not offer precious
+Sign up free at https://metals.dev/ — Alpha Vantage does not offer precious
 metals data on any tier despite XAU/XAG/XPT/XPD looking like currency codes,
-so this is a separate provider just for those four. Free tier is limited
-(historically ~50 requests/month); the script uses 1 call per metal per
-weekday run, so keep an eye on your usage dashboard. If the historical
-"timeframe" endpoint isn't available on your plan, the script automatically
-falls back to showing just the current price with no chart or change — it
-won't crash the whole report.
+so this is a separate provider just for those four. Metals.Dev's free plan
+genuinely requires no credit card and includes about 100 requests/month.
+The script makes just 1 call per run (a single timeseries request covers all
+four metals plus 14 days of history), so weekday runs use roughly 22-25
+calls/month — comfortably within the free tier.
 
 ## 3. Get SMTP credentials
 
