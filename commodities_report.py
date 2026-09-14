@@ -2,40 +2,52 @@
 Daily Commodities Report
 -------------------------
 Fetches prices for a configurable list of commodities, builds a tiered
-HTML email (headline movers in full, secondary commodities compact,
-inventory data when available), and sends it via SMTP.
+HTML email with small trend charts for the headline movers, and sends
+it via SMTP.
 
 Data sources:
   - EIA API (free, official US gov't data): WTI, Brent, Natural Gas,
-    plus weekly crude oil inventory data.
+    daily resolution, plus weekly crude oil inventory data.
   - Alpha Vantage (free tier): Copper, Aluminum, Wheat, Corn.
-  - Alpha Vantage FX endpoint (free tier): Gold (XAU), Silver (XAG),
-    Platinum (XPT), Palladium (XPD) — precious metals are quoted as
-    currency pairs against USD.
+    IMPORTANT: these four endpoints only support Monthly/Quarterly/Annual
+    resolution on Alpha Vantage — there is no daily data available for
+    them at any tier. The "change" shown for these is month-over-month,
+    not day-over-day, and is labeled as such in the email.
+  - Metals-API (free tier): Gold (XAU), Silver (XAG), Platinum (XPT),
+    Palladium (XPD). Alpha Vantage does not offer precious metals data
+    on the free tier (or possibly any tier) — its forex endpoint only
+    covers real currency pairs, not metals, despite XAU/XAG/XPT/XPD
+    looking like currency codes. Metals-API is a dedicated provider.
 
-Note: Alpha Vantage's free commodities endpoint doesn't cover Soybeans
-or Steel. Those are left as "N/A" with a comment showing where to plug
-in a paid source (Nasdaq Data Link / Trading Economics) if you want them.
+Note: Alpha Vantage doesn't cover Soybeans or Steel at all. Those stay
+"N/A" — plug in a paid source (Nasdaq Data Link / Trading Economics) if
+you want them.
 
 Environment variables required (see README.md for how to get each):
   EIA_API_KEY            - free, from https://www.eia.gov/opendata/register.php
-  ALPHAVANTAGE_API_KEY    - free, from https://www.alphavantage.co/support/#api-key
+  ALPHAVANTAGE_API_KEY   - free, from https://www.alphavantage.co/support/#api-key
+  METALS_API_KEY         - free, from https://metals-api.com/
   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD  - your email provider's SMTP creds
-  REPORT_TO_EMAIL         - where the report gets sent
-  REPORT_FROM_EMAIL       - the "from" address (often same as SMTP_USER)
+  REPORT_TO_EMAIL        - where the report gets sent
+  REPORT_FROM_EMAIL      - the "from" address (often same as SMTP_USER)
 """
 
 import os
+import io
+import base64
 import smtplib
 import requests
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-# Set up logging for GitHub Actions & local debugging
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
@@ -44,52 +56,46 @@ logger = logging.getLogger(__name__)
 
 EIA_API_KEY = os.environ.get("EIA_API_KEY", "")
 AV_API_KEY = os.environ.get("ALPHAVANTAGE_API_KEY", "")
+METALS_API_KEY = os.environ.get("METALS_API_KEY", "")
 
-# Alpha Vantage free tier allows only 5 requests/minute. This script makes
-# ~8 AV calls per run, so we space them out to stay under that limit.
+# Alpha Vantage free tier allows only 5 requests/minute.
 AV_THROTTLE_SECONDS = 13
 
 # ---------------------------------------------------------------------------
 # Commodity configuration
-# tier 1 = always shown in full with a "why it moved" line if it's a big move
-# tier 2 = compact table, only gets commentary if the move is > 2%
+# tier 1 = headline movers, shown in full WITH a trend chart
+# tier 2 = compact table, no chart, commentary only on moves > 2%
+# resolution: "daily" or "monthly" — controls the label shown in the email
 # ---------------------------------------------------------------------------
 COMMODITIES = [
-    {"name": "WTI Crude",     "tier": 1, "source": "eia",       "series_id": "PET.RWTC.D"},
-    {"name": "Brent Crude",   "tier": 1, "source": "eia",       "series_id": "PET.RBRTE.D"},
-    {"name": "Gold",          "tier": 1, "source": "av_fx",     "symbol": "XAU"},
-    {"name": "Copper",        "tier": 1, "source": "av_commod", "function": "COPPER"},
-    {"name": "Natural Gas",   "tier": 2, "source": "eia",       "series_id": "NG.RNGWHHD.D"},
-    {"name": "Silver",        "tier": 2, "source": "av_fx",     "symbol": "XAG"},
-    {"name": "Platinum",      "tier": 2, "source": "av_fx",     "symbol": "XPT"},
-    {"name": "Palladium",     "tier": 2, "source": "av_fx",     "symbol": "XPD"},
-    {"name": "Aluminum",      "tier": 2, "source": "av_commod", "function": "ALUMINUM"},
-    {"name": "Steel",         "tier": 2, "source": "none"},   # no free API source; add manually if needed
-    {"name": "Corn",          "tier": 2, "source": "av_commod", "function": "CORN"},
-    {"name": "Wheat",         "tier": 2, "source": "av_commod", "function": "WHEAT"},
-    {"name": "Soybeans",      "tier": 2, "source": "none"},   # no free API source; add manually if needed
+    {"name": "WTI Crude",     "tier": 1, "source": "eia",       "series_id": "PET.RWTC.D", "resolution": "daily"},
+    {"name": "Brent Crude",   "tier": 1, "source": "eia",       "series_id": "PET.RBRTE.D", "resolution": "daily"},
+    {"name": "Gold",          "tier": 1, "source": "metals",    "symbol": "XAU", "resolution": "daily"},
+    {"name": "Copper",        "tier": 1, "source": "av_commod", "function": "COPPER", "resolution": "monthly"},
+    {"name": "Natural Gas",   "tier": 2, "source": "eia",       "series_id": "NG.RNGWHHD.D", "resolution": "daily"},
+    {"name": "Silver",        "tier": 2, "source": "metals",    "symbol": "XAG", "resolution": "daily"},
+    {"name": "Platinum",      "tier": 2, "source": "metals",    "symbol": "XPT", "resolution": "daily"},
+    {"name": "Palladium",     "tier": 2, "source": "metals",    "symbol": "XPD", "resolution": "daily"},
+    {"name": "Aluminum",      "tier": 2, "source": "av_commod", "function": "ALUMINUM", "resolution": "monthly"},
+    {"name": "Steel",         "tier": 2, "source": "none"},
+    {"name": "Corn",          "tier": 2, "source": "av_commod", "function": "CORN", "resolution": "monthly"},
+    {"name": "Wheat",         "tier": 2, "source": "av_commod", "function": "WHEAT", "resolution": "monthly"},
+    {"name": "Soybeans",      "tier": 2, "source": "none"},
 ]
 
-BIG_MOVE_THRESHOLD_TIER1 = 1.0   # % change that triggers a "why it moved" note for tier 1
-BIG_MOVE_THRESHOLD_TIER2 = 2.0   # % change that triggers commentary for tier 2
-
-# Minimum data quality threshold: abort send if < this % of commodities have data
-MIN_DATA_QUALITY = 0.5  # 50%
+BIG_MOVE_THRESHOLD_TIER1 = 1.0
+BIG_MOVE_THRESHOLD_TIER2 = 2.0
+MIN_DATA_QUALITY = 0.5
 
 
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
 def validate_environment():
-    """Ensure all required environment variables are set."""
     required_vars = [
-        "EIA_API_KEY",
-        "ALPHAVANTAGE_API_KEY",
-        "SMTP_HOST",
-        "SMTP_USER",
-        "SMTP_PASSWORD",
-        "REPORT_TO_EMAIL",
-        "REPORT_FROM_EMAIL"
+        "EIA_API_KEY", "ALPHAVANTAGE_API_KEY", "METALS_API_KEY",
+        "SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD",
+        "REPORT_TO_EMAIL", "REPORT_FROM_EMAIL",
     ]
     missing = [v for v in required_vars if not os.environ.get(v)]
     if missing:
@@ -98,28 +104,21 @@ def validate_environment():
 
 
 def fetch_with_retry(url, params, max_retries=3, backoff=2):
-    """
-    Fetch with exponential backoff for transient failures.
-    Raises exception only after all retries exhausted.
-    """
     for attempt in range(max_retries):
         try:
             resp = requests.get(url, params=params, timeout=15)
-
-            # Handle rate limiting gracefully
             if resp.status_code == 429:
                 wait_time = backoff ** attempt
                 logger.warning(f"Rate limited (429). Attempt {attempt + 1}/{max_retries}, waiting {wait_time}s...")
                 time.sleep(wait_time)
                 continue
-
             resp.raise_for_status()
 
-            # Alpha Vantage returns HTTP 200 even when rate-limited — the
-            # limit message shows up as an "Information" or "Note" key
-            # instead of the expected data key. Treat that as a retryable
-            # rate-limit, not a data-shape error.
-            body = resp.json()
+            # Alpha Vantage returns HTTP 200 even when rate-limited.
+            try:
+                body = resp.json()
+            except ValueError:
+                return resp  # not JSON (shouldn't happen for these APIs)
             if isinstance(body, dict) and ("Information" in body or "Note" in body):
                 msg = body.get("Information") or body.get("Note")
                 if attempt == max_retries - 1:
@@ -136,31 +135,31 @@ def fetch_with_retry(url, params, max_retries=3, backoff=2):
             wait_time = backoff ** attempt
             logger.warning(f"Attempt {attempt + 1} failed, retrying in {wait_time}s: {e}")
             time.sleep(wait_time)
-    # All retries were 429s with no exception raised — treat as failure.
-    raise RuntimeError(f"Exhausted retries for {url} (rate limited).")
+    raise RuntimeError(f"Exhausted retries for {url}.")
 
 
 # ---------------------------------------------------------------------------
-# Data fetchers
+# Data fetchers — each returns {"price", "change", "pct_change", "history": [(date, price), ...]}
+# "history" is ascending by date and used to draw the trend chart (tier 1 only).
 # ---------------------------------------------------------------------------
 def fetch_eia_series(series_id):
-    """Pull the two most recent daily values from EIA and compute % change."""
     url = "https://api.eia.gov/v2/seriesid/" + series_id
     params = {"api_key": EIA_API_KEY}
     resp = fetch_with_retry(url, params=params)
-    data = resp.json()["response"]["data"]
-    # EIA returns newest first
+    data = resp.json()["response"]["data"]  # newest first
     latest = float(data[0]["value"])
     previous = float(data[1]["value"])
     change = latest - previous
     pct_change = (change / previous) * 100 if previous else 0
-    return {"price": latest, "change": change, "pct_change": pct_change}
+    history = [(d["period"], float(d["value"])) for d in reversed(data[:14])]
+    return {"price": latest, "change": change, "pct_change": pct_change, "history": history}
 
 
 def fetch_av_commodity(function):
-    """Alpha Vantage commodities endpoint (monthly-resolution for some, daily for others)."""
+    """Copper/Aluminum/Wheat/Corn — Alpha Vantage only supports these at
+    monthly/quarterly/annual resolution, so request monthly explicitly."""
     url = "https://www.alphavantage.co/query"
-    params = {"function": function, "interval": "daily", "apikey": AV_API_KEY}
+    params = {"function": function, "interval": "monthly", "apikey": AV_API_KEY}
     resp = fetch_with_retry(url, params=params)
     js = resp.json().get("data", [])
     if not js or len(js) < 2:
@@ -169,34 +168,57 @@ def fetch_av_commodity(function):
     previous = float(js[1]["value"])
     change = latest - previous
     pct_change = (change / previous) * 100 if previous else 0
-    return {"price": latest, "change": change, "pct_change": pct_change}
+    history = [(d["date"], float(d["value"])) for d in reversed(js[:12])]
+    return {"price": latest, "change": change, "pct_change": pct_change, "history": history}
 
 
-def fetch_av_fx(symbol):
-    """Precious metals via Alpha Vantage FX_DAILY (quoted as e.g. XAU/USD)."""
-    url = "https://www.alphavantage.co/query"
+def fetch_metals(symbol):
+    """Precious metals via Metals-API. Tries a 14-day timeframe call first
+    (gives both the chart and a real day-over-day change in one request);
+    falls back to a single /latest call (current price only, no chart or
+    change) if the timeframe endpoint isn't available on the current plan."""
+    today = datetime.now(ZoneInfo("America/New_York")).date()
+    start = today - timedelta(days=14)
+    url = "https://metals-api.com/api/timeframe"
     params = {
-        "function": "FX_DAILY",
-        "from_symbol": symbol,
-        "to_symbol": "USD",
-        "apikey": AV_API_KEY,
+        "access_key": METALS_API_KEY,
+        "base": "USD",
+        "symbols": symbol,
+        "start_date": start.isoformat(),
+        "end_date": today.isoformat(),
     }
-    resp = fetch_with_retry(url, params=params)
-    series = resp.json().get("Time Series FX (Daily)", {})
-    if not series:
-        raise ValueError(f"No time series data for {symbol}")
-    dates = sorted(series.keys(), reverse=True)
-    if len(dates) < 2:
-        raise ValueError(f"Insufficient historical data for {symbol}")
-    latest = float(series[dates[0]]["4. close"])
-    previous = float(series[dates[1]]["4. close"])
-    change = latest - previous
-    pct_change = (change / previous) * 100 if previous else 0
-    return {"price": latest, "change": change, "pct_change": pct_change}
+    try:
+        resp = fetch_with_retry(url, params=params)
+        body = resp.json()
+        if not body.get("success"):
+            raise RuntimeError(body.get("error", {}).get("info", "timeframe call failed"))
+        rates = body["rates"]  # {date: {symbol: rate}}
+        dated_prices = []
+        for date_str in sorted(rates.keys()):
+            rate = rates[date_str].get(symbol)
+            if rate:
+                dated_prices.append((date_str, 1 / rate))
+        if len(dated_prices) < 2:
+            raise RuntimeError("Not enough historical points returned")
+        latest_date, latest = dated_prices[-1]
+        _, previous = dated_prices[-2]
+        change = latest - previous
+        pct_change = (change / previous) * 100 if previous else 0
+        return {"price": latest, "change": change, "pct_change": pct_change, "history": dated_prices}
+    except Exception as e:
+        logger.warning(f"Metals-API timeframe call failed for {symbol} ({e}), falling back to /latest")
+        url = "https://metals-api.com/api/latest"
+        params = {"access_key": METALS_API_KEY, "base": "USD", "symbols": symbol}
+        resp = fetch_with_retry(url, params=params)
+        body = resp.json()
+        if not body.get("success"):
+            raise RuntimeError(body.get("error", {}).get("info", "latest call failed"))
+        rate = body["rates"][symbol]
+        price = 1 / rate
+        return {"price": price, "change": 0.0, "pct_change": 0.0, "history": []}
 
 
 def fetch_eia_crude_inventory():
-    """Weekly EIA crude oil stockpile change (only meaningful on release days, Wed)."""
     url = "https://api.eia.gov/v2/seriesid/PET.WCRSTUS1.W"
     params = {"api_key": EIA_API_KEY}
     resp = fetch_with_retry(url, params=params)
@@ -215,8 +237,8 @@ def fetch_commodity(commodity):
             return fetch_eia_series(commodity["series_id"])
         elif source == "av_commod":
             return fetch_av_commodity(commodity["function"])
-        elif source == "av_fx":
-            return fetch_av_fx(commodity["symbol"])
+        elif source == "metals":
+            return fetch_metals(commodity["symbol"])
         else:
             return None
     except Exception as e:
@@ -225,28 +247,49 @@ def fetch_commodity(commodity):
 
 
 # ---------------------------------------------------------------------------
+# Charting — small sparkline PNGs, embedded inline as base64 data URIs
+# ---------------------------------------------------------------------------
+def build_sparkline_b64(history):
+    """history: list of (label, value) ascending. Returns base64 PNG or None."""
+    if not history or len(history) < 2:
+        return None
+    values = [v for _, v in history]
+    color = "#1a7f37" if values[-1] >= values[0] else "#c0342c"
+
+    fig, ax = plt.subplots(figsize=(2.6, 0.7), dpi=120)
+    ax.plot(range(len(values)), values, color=color, linewidth=1.8)
+    ax.fill_between(range(len(values)), values, min(values), color=color, alpha=0.08)
+    ax.axis("off")
+    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", transparent=True)
+    plt.close(fig)
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode("ascii")
+
+
+# ---------------------------------------------------------------------------
 # Email formatting
 # ---------------------------------------------------------------------------
 def fmt_price(v):
-    """Format price with validation for edge cases."""
     if v is None or v < 0:
         return "N/A"
     return f"${v:,.2f}"
 
 
-def fmt_change(change, pct):
+def fmt_change(change, pct, resolution="daily"):
     sign = "+" if change >= 0 else ""
     color = "#1a7f37" if change >= 0 else "#c0342c"
     arrow = "▲" if change >= 0 else "▼"
-    return f'<span style="color:{color};">{arrow} {sign}{change:,.2f} ({sign}{pct:.1f}%)</span>'
+    label = " (mo/mo)" if resolution == "monthly" else ""
+    return f'<span style="color:{color};">{arrow} {sign}{change:,.2f} ({sign}{pct:.1f}%){label}</span>'
 
 
 def build_html(results, inventory, data_quality):
-    """Build HTML email with optional data quality warning."""
     eastern = ZoneInfo("America/New_York")
     today = datetime.now(eastern).strftime("%A, %B %d, %Y")
 
-    # Data quality warning
     quality_warning = ""
     if data_quality < 1.0:
         warning_pct = int(data_quality * 100)
@@ -264,17 +307,21 @@ def build_html(results, inventory, data_quality):
             continue
         r = results.get(c["name"])
         if not r:
-            tier1_rows += f'<tr><td style="padding:8px;">{c["name"]}</td><td colspan="2" style="padding:8px;color:#888;">data unavailable</td></tr>'
+            tier1_rows += f'<tr><td style="padding:8px;">{c["name"]}</td><td colspan="3" style="padding:8px;color:#888;">data unavailable</td></tr>'
             continue
+        chart_b64 = build_sparkline_b64(r.get("history", []))
+        chart_cell = f'<img src="data:image/png;base64,{chart_b64}" width="90" height="24" alt="trend" />' if chart_b64 else ""
         tier1_rows += (
             f'<tr>'
             f'<td style="padding:8px;font-weight:600;">{c["name"]}</td>'
             f'<td style="padding:8px;">{fmt_price(r["price"])}</td>'
-            f'<td style="padding:8px;">{fmt_change(r["change"], r["pct_change"])}</td>'
+            f'<td style="padding:8px;">{fmt_change(r["change"], r["pct_change"], c.get("resolution", "daily"))}</td>'
+            f'<td style="padding:8px;">{chart_cell}</td>'
             f'</tr>'
         )
         if abs(r["pct_change"]) >= BIG_MOVE_THRESHOLD_TIER1:
-            movers_notes += f'<li><b>{c["name"]}</b> moved {r["pct_change"]:+.1f}% — check news for the driver.</li>'
+            period_word = "this month" if c.get("resolution") == "monthly" else "today"
+            movers_notes += f'<li><b>{c["name"]}</b> moved {r["pct_change"]:+.1f}% {period_word} — check news for the driver.</li>'
 
     tier2_rows = ""
     for c in COMMODITIES:
@@ -289,7 +336,7 @@ def build_html(results, inventory, data_quality):
             f'<tr>'
             f'<td style="padding:6px 8px;">{c["name"]}{note}</td>'
             f'<td style="padding:6px 8px;">{fmt_price(r["price"])}</td>'
-            f'<td style="padding:6px 8px;">{fmt_change(r["change"], r["pct_change"])}</td>'
+            f'<td style="padding:6px 8px;">{fmt_change(r["change"], r["pct_change"], c.get("resolution", "daily"))}</td>'
             f'</tr>'
         )
 
@@ -311,7 +358,7 @@ def build_html(results, inventory, data_quality):
 
     html = f"""
     <html>
-    <body style="font-family: -apple-system, Arial, sans-serif; color:#1a1a1a; max-width:600px; margin:0 auto;">
+    <body style="font-family: -apple-system, Arial, sans-serif; color:#1a1a1a; max-width:640px; margin:0 auto;">
         <h2 style="margin-bottom:0;">Commodities Report</h2>
         <p style="color:#666; margin-top:4px;">{today}</p>
 
@@ -332,7 +379,8 @@ def build_html(results, inventory, data_quality):
         {inventory_section}
 
         <p style="font-size:11px; color:#999; margin-top:32px;">
-            Automated report. Data from EIA and Alpha Vantage. Not investment advice.
+            Automated report. Data from EIA, Alpha Vantage, and Metals-API. Not investment advice.
+            Copper/Aluminum/Corn/Wheat changes are month-over-month (no daily data available from source).
         </p>
     </body>
     </html>
@@ -344,7 +392,6 @@ def build_html(results, inventory, data_quality):
 # Send
 # ---------------------------------------------------------------------------
 def send_email(html_body, dry_run=False):
-    """Send the email, or preview it in dry-run mode."""
     if dry_run:
         logger.info("DRY RUN MODE: Email preview (not sending):")
         logger.info(html_body)
@@ -375,9 +422,7 @@ def main(dry_run=False):
     results = {}
     av_calls_made = 0
     for c in COMMODITIES:
-        # Throttle Alpha Vantage calls to stay under their 5-requests/minute
-        # free-tier limit. EIA has no such limit, so skip throttling for those.
-        if c["source"] in ("av_commod", "av_fx"):
+        if c["source"] == "av_commod":
             if av_calls_made > 0:
                 time.sleep(AV_THROTTLE_SECONDS)
             av_calls_made += 1
@@ -385,16 +430,11 @@ def main(dry_run=False):
         if r:
             results[c["name"]] = r
 
-    # Calculate data quality
     total_commodities = len([c for c in COMMODITIES if c["source"] != "none"])
     successful_fetches = len(results)
     data_quality = successful_fetches / total_commodities if total_commodities > 0 else 0
-
     logger.info(f"Data quality: {successful_fetches}/{total_commodities} commodities ({data_quality*100:.0f}%)")
 
-    # Abort if data quality is too low. IMPORTANT: this raises rather than
-    # returning, so the GitHub Actions job fails loudly (red X) instead of
-    # showing a false green checkmark while silently sending nothing.
     if data_quality < MIN_DATA_QUALITY:
         raise RuntimeError(
             f"Data quality {data_quality*100:.0f}% below minimum {MIN_DATA_QUALITY*100:.0f}%. "
