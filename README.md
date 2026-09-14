@@ -1,4 +1,4 @@
-[README (1).md](https://github.com/user-attachments/files/32208696/README.1.md)
+[README.md](https://github.com/user-attachments/files/32210731/README.md)
 # Daily Commodities Report
 
 Sends you a tiered HTML email every weekday morning: headline movers (WTI, Brent,
@@ -59,6 +59,33 @@ warning per commodity that fails to fetch instead of crashing the whole report.
 4. To test it without waiting for the schedule: go to the **Actions** tab →
    "Daily Commodities Report" → **Run workflow**.
 
+## 6. Enable the interactive dashboard (GitHub Pages)
+
+The workflow now also generates `docs/data/price_history.json`, a persisted
+price-history archive, and `docs/index.html`, a dashboard page with selectable
+timeframes (1M/3M/6M/YTD/1Y/5Y) and moving averages (200/50/20-day SMA, 10-day
+EMA). To publish it:
+
+1. **Important: GitHub Pages requires a public repo on the free plan.**
+   Private-repo Pages hosting needs GitHub Pro/Team/Enterprise. Your API keys
+   and email credentials stay safe either way — GitHub Actions secrets are
+   encrypted and never exposed in the repo or logs regardless of visibility —
+   but the *code* and any data files become publicly viewable if you switch.
+   If that's fine: **Settings → General → Danger Zone → Change visibility →
+   Public**. If not, either keep the dashboard unpublished (the email report
+   still works fully without it) or upgrade your GitHub plan.
+2. **Settings → Pages → Source: Deploy from a branch → Branch: `main`,
+   folder: `/docs` → Save.**
+3. GitHub will publish it at `https://<your-username>.github.io/<repo-name>/`
+   within a minute or two. The daily email links to this URL automatically at
+   the bottom of the report.
+4. The first run **bootstraps** roughly a year of Gold/Silver/Platinum/Palladium
+   history (about 13 API calls, one-time). WTI/Brent/Natural Gas get full
+   history immediately since EIA has no historical-range limit. The 200-day
+   moving average for the metals won't have enough data to display until
+   about 7 months of daily runs have accumulated — the dashboard shows a note
+   explaining this until then.
+
 ## Coverage notes
 
 - Soybeans and Steel don't have a clean free-tier API source, so they're left as
@@ -67,6 +94,8 @@ warning per commodity that fails to fetch instead of crashing the whole report.
   `fetch_commodity()` the same way the others do.
 - Alpha Vantage's free tier is rate-limited (25 calls/day). This script uses
   about 9 per run, so running it more than twice a day will hit the limit.
+- Copper doesn't get dashboard charting for now — Alpha Vantage only offers
+  monthly resolution for it, which doesn't fit the daily-history dashboard.
 
 ---
 
