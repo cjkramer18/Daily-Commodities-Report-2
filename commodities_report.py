@@ -35,11 +35,13 @@ Environment variables required (see README.md for how to get each):
 
 import os
 import io
+import json
 import smtplib
 import requests
 import logging
 import time
-from datetime import datetime, timedelta
+from pathlib import Path
+from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -61,6 +63,23 @@ METALS_API_KEY = os.environ.get("METALS_API_KEY", "")
 
 # Alpha Vantage free tier allows only 5 requests/minute.
 AV_THROTTLE_SECONDS = 13
+
+# ---------------------------------------------------------------------------
+# Dashboard data — a persisted price-history archive feeds a GitHub Pages
+# dashboard with year+ timeframes and moving averages. EIA has enough history
+# in a single call that no persistence is needed there. Metals.Dev caps each
+# historical request at 30 days, so its archive is built once (bootstrap)
+# and then extended by 1 call/day going forward.
+# ---------------------------------------------------------------------------
+METALS_ARCHIVE_PATH = "data/metals_history.json"
+DASHBOARD_DATA_PATH = "docs/data/price_history.json"
+BOOTSTRAP_TARGET_DAYS = 365
+METAL_KEYS = {"gold": "Gold", "silver": "Silver", "platinum": "Platinum", "palladium": "Palladium"}
+DASHBOARD_EIA_SERIES = {
+    "WTI Crude": "PET.RWTC.D",
+    "Brent Crude": "PET.RBRTE.D",
+    "Natural Gas": "NG.RNGWHHD.D",
+}
 
 # ---------------------------------------------------------------------------
 # Commodity configuration
@@ -173,43 +192,139 @@ def fetch_av_commodity(function):
     return {"price": latest, "change": change, "pct_change": pct_change, "history": history}
 
 
-def fetch_metals_dev_batch():
-    """One call to Metals.Dev's timeseries endpoint returns Gold, Silver,
-    Platinum, and Palladium together for the whole date range — far more
-    efficient than fetching each metal separately."""
-    today = datetime.now(ZoneInfo("America/New_York")).date()
-    start = today - timedelta(days=13)  # 14-day window, within their 30-day max
+# ---------------------------------------------------------------------------
+# Persisted metals history archive (for the dashboard's long timeframes)
+# ---------------------------------------------------------------------------
+def load_json(path):
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"Could not read {path} ({e}), starting fresh")
+        return {}
+
+
+def save_json(path, data):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, indent=2, sort_keys=True))
+
+
+def fetch_metals_dev_range(start_date, end_date):
+    """One Metals.Dev timeseries call (max 30-day span). Returns
+    {date_str: {"gold":.., "silver":.., "platinum":.., "palladium":..}}."""
     url = "https://api.metals.dev/v1/timeseries"
     params = {
         "api_key": METALS_API_KEY,
-        "start_date": start.isoformat(),
-        "end_date": today.isoformat(),
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
     }
     resp = fetch_with_retry(url, params=params)
     body = resp.json()
     if body.get("status") != "success":
         raise RuntimeError(body.get("error_message", "Metals.Dev request failed"))
-
-    rates = body["rates"]  # {date_str: {"metals": {"gold": .., "silver": .., ...}, ...}}
-    sorted_dates = sorted(rates.keys())
-
-    metal_keys = {"gold": "Gold", "silver": "Silver", "platinum": "Platinum", "palladium": "Palladium"}
     out = {}
-    for metal_key, display_name in metal_keys.items():
-        history = []
-        for date_str in sorted_dates:
-            price = rates[date_str].get("metals", {}).get(metal_key)
-            if price is not None:
-                history.append((date_str, float(price)))
+    for date_str, entry in body.get("rates", {}).items():
+        metals = entry.get("metals", {})
+        if metals:
+            out[date_str] = {k: metals[k] for k in METAL_KEYS if k in metals}
+    return out
+
+
+def bootstrap_or_update_metals_archive():
+    """Loads the persisted archive. If it's thin (first run), backfills up to
+    BOOTSTRAP_TARGET_DAYS via chunked 30-day calls. Otherwise just pulls the
+    last 5 days (cheap, 1 call) to extend the archive and cover any gaps."""
+    archive = load_json(METALS_ARCHIVE_PATH)
+    today = datetime.now(ZoneInfo("America/New_York")).date()
+
+    if len(archive) < BOOTSTRAP_TARGET_DAYS:
+        logger.info(f"Metals archive has {len(archive)} days, bootstrapping toward {BOOTSTRAP_TARGET_DAYS}...")
+        chunk_end = today
+        calls = 0
+        max_calls = 13  # ~13 * 29 days ≈ 1 year, one-time cost
+        while len(archive) < BOOTSTRAP_TARGET_DAYS and calls < max_calls:
+            chunk_start = chunk_end - timedelta(days=29)
+            try:
+                chunk = fetch_metals_dev_range(chunk_start, chunk_end)
+                archive.update(chunk)
+            except Exception as e:
+                logger.warning(f"Bootstrap chunk {chunk_start}..{chunk_end} failed: {e}")
+                break
+            chunk_end = chunk_start - timedelta(days=1)
+            calls += 1
+            if calls < max_calls:
+                time.sleep(2)
+        logger.info(f"Bootstrap complete: {len(archive)} days in archive after {calls} calls")
+    else:
+        try:
+            recent = fetch_metals_dev_range(today - timedelta(days=4), today)
+            archive.update(recent)
+        except Exception as e:
+            logger.warning(f"Metals archive daily update failed: {e}")
+
+    save_json(METALS_ARCHIVE_PATH, archive)
+    return archive
+
+
+def metals_results_from_archive(archive):
+    """Builds the same {"price","change","pct_change","history"} shape the
+    email tables expect, from the persisted archive — no extra API calls."""
+    sorted_dates = sorted(archive.keys())
+    out = {}
+    for metal_key, display_name in METAL_KEYS.items():
+        history = [(d, archive[d][metal_key]) for d in sorted_dates if metal_key in archive[d]]
         if len(history) < 2:
-            logger.warning(f"Not enough Metals.Dev history for {display_name}")
             continue
         latest = history[-1][1]
         previous = history[-2][1]
         change = latest - previous
         pct_change = (change / previous) * 100 if previous else 0
-        out[display_name] = {"price": latest, "change": change, "pct_change": pct_change, "history": history}
+        out[display_name] = {"price": latest, "change": change, "pct_change": pct_change, "history": history[-14:]}
     return out
+
+
+def fetch_eia_history_full(series_id):
+    """Fetches as much daily history as EIA returns in one call (typically
+    years) for the dashboard — no persistence needed for EIA sources."""
+    url = "https://api.eia.gov/v2/seriesid/" + series_id
+    params = {"api_key": EIA_API_KEY, "length": 1825}
+    resp = fetch_with_retry(url, params=params)
+    data = resp.json()["response"]["data"]  # newest first
+    return [(d["period"], float(d["value"])) for d in reversed(data)]
+
+
+def build_dashboard_data(metals_archive):
+    """Writes the combined JSON the GitHub Pages dashboard reads."""
+    series = {}
+    for name, series_id in DASHBOARD_EIA_SERIES.items():
+        try:
+            history = fetch_eia_history_full(series_id)
+            series[name] = [{"date": d, "price": p} for d, p in history]
+        except Exception as e:
+            logger.warning(f"Dashboard data: EIA fetch failed for {name}: {e}")
+
+    sorted_dates = sorted(metals_archive.keys())
+    for metal_key, display_name in METAL_KEYS.items():
+        history = [(d, metals_archive[d][metal_key]) for d in sorted_dates if metal_key in metals_archive[d]]
+        series[display_name] = [{"date": d, "price": p} for d, p in history]
+
+    payload = {
+        "generated_at": datetime.now(ZoneInfo("America/New_York")).isoformat(),
+        "series": series,
+    }
+    save_json(DASHBOARD_DATA_PATH, payload)
+    logger.info(f"Dashboard data written to {DASHBOARD_DATA_PATH} ({sum(len(v) for v in series.values())} total points)")
+
+
+def dashboard_url():
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    if "/" not in repo:
+        return None
+    owner, name = repo.split("/", 1)
+    return f"https://{owner}.github.io/{name}/"
 
 
 def fetch_eia_crude_inventory():
@@ -356,6 +471,13 @@ def build_html(results, inventory, data_quality):
         <ul style="font-size:14px;">{movers_notes}</ul>
         """
 
+    dashboard_link_section = ""
+    dash_url = dashboard_url()
+    if dash_url:
+        dashboard_link_section = f"""
+        <p style="margin-top:24px;"><a href="{dash_url}" style="color:#185fa5; font-size:14px;">View interactive charts (year+ history, moving averages) →</a></p>
+        """
+
     html = f"""
     <html>
     <body style="font-family: -apple-system, Arial, sans-serif; color:#1a1a1a; max-width:640px; margin:0 auto;">
@@ -378,8 +500,10 @@ def build_html(results, inventory, data_quality):
 
         {inventory_section}
 
+        {dashboard_link_section}
+
         <p style="font-size:11px; color:#999; margin-top:32px;">
-            Automated report. Data from EIA, Alpha Vantage, and Metals-API. Not investment advice.
+            Automated report. Data from EIA, Alpha Vantage, and Metals.Dev. Not investment advice.
             Copper/Aluminum/Corn/Wheat changes are month-over-month (no daily data available from source).
         </p>
     </body>
@@ -431,13 +555,24 @@ def send_email(html_body, chart_images=None, dry_run=False):
 def main(dry_run=False):
     validate_environment()
 
+    # Build/update the dashboard data first, independent of the email logic
+    # below — the dashboard should stay current even if the email later
+    # aborts on low data quality.
+    metals_archive = {}
+    try:
+        metals_archive = bootstrap_or_update_metals_archive()
+        build_dashboard_data(metals_archive)
+    except Exception as e:
+        logger.warning(f"Dashboard data build failed (non-fatal): {e}")
+
     results = {}
 
-    # Precious metals: one batched call covers all four (Gold, Silver, Platinum, Palladium)
+    # Precious metals for the email: derived from the same archive above,
+    # no extra API calls needed.
     try:
-        results.update(fetch_metals_dev_batch())
+        results.update(metals_results_from_archive(metals_archive))
     except Exception as e:
-        logger.warning(f"Metals.Dev batch fetch failed: {e}")
+        logger.warning(f"Could not derive metals results from archive: {e}")
 
     av_calls_made = 0
     for c in COMMODITIES:
