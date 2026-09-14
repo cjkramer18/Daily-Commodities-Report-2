@@ -45,6 +45,10 @@ logger = logging.getLogger(__name__)
 EIA_API_KEY = os.environ.get("EIA_API_KEY", "")
 AV_API_KEY = os.environ.get("ALPHAVANTAGE_API_KEY", "")
 
+# Alpha Vantage free tier allows only 5 requests/minute. This script makes
+# ~8 AV calls per run, so we space them out to stay under that limit.
+AV_THROTTLE_SECONDS = 13
+
 # ---------------------------------------------------------------------------
 # Commodity configuration
 # tier 1 = always shown in full with a "why it moved" line if it's a big move
@@ -110,6 +114,20 @@ def fetch_with_retry(url, params, max_retries=3, backoff=2):
                 continue
 
             resp.raise_for_status()
+
+            # Alpha Vantage returns HTTP 200 even when rate-limited — the
+            # limit message shows up as an "Information" or "Note" key
+            # instead of the expected data key. Treat that as a retryable
+            # rate-limit, not a data-shape error.
+            body = resp.json()
+            if isinstance(body, dict) and ("Information" in body or "Note" in body):
+                msg = body.get("Information") or body.get("Note")
+                if attempt == max_retries - 1:
+                    raise RuntimeError(f"Alpha Vantage rate limit: {msg}")
+                logger.warning(f"Alpha Vantage rate-limited, waiting {AV_THROTTLE_SECONDS}s before retry...")
+                time.sleep(AV_THROTTLE_SECONDS)
+                continue
+
             return resp
         except (requests.RequestException, requests.Timeout) as e:
             if attempt == max_retries - 1:
@@ -355,7 +373,14 @@ def main(dry_run=False):
     validate_environment()
 
     results = {}
+    av_calls_made = 0
     for c in COMMODITIES:
+        # Throttle Alpha Vantage calls to stay under their 5-requests/minute
+        # free-tier limit. EIA has no such limit, so skip throttling for those.
+        if c["source"] in ("av_commod", "av_fx"):
+            if av_calls_made > 0:
+                time.sleep(AV_THROTTLE_SECONDS)
+            av_calls_made += 1
         r = fetch_commodity(c)
         if r:
             results[c["name"]] = r
