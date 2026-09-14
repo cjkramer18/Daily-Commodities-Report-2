@@ -5,6 +5,9 @@ on:
     - cron: "0 12 * * 1-5"
   workflow_dispatch: {}
 
+permissions:
+  contents: write
+
 jobs:
   send-report:
     runs-on: ubuntu-latest
@@ -31,3 +34,16 @@ jobs:
           REPORT_TO_EMAIL: ${{ secrets.REPORT_TO_EMAIL }}
           REPORT_FROM_EMAIL: ${{ secrets.REPORT_FROM_EMAIL }}
         run: python commodities_report.py
+
+      # Runs even if the report step above failed (e.g. low data quality
+      # aborted the email) — the dashboard data should still be committed
+      # if it was updated, since chart history matters independently of
+      # whether today's email went out.
+      - name: Commit updated price history data
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/metals_history.json docs/data/price_history.json
+          git diff --staged --quiet || git commit -m "Update price history data [skip ci]"
+          git push
