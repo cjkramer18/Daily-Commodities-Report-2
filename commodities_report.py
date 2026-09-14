@@ -35,7 +35,6 @@ Environment variables required (see README.md for how to get each):
 
 import os
 import io
-import base64
 import smtplib
 import requests
 import logging
@@ -44,6 +43,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
 
 import matplotlib
 matplotlib.use("Agg")
@@ -239,10 +239,13 @@ def fetch_commodity(commodity):
 
 
 # ---------------------------------------------------------------------------
-# Charting — small sparkline PNGs, embedded inline as base64 data URIs
+# Charting — small sparkline PNGs, embedded as proper CID email attachments.
+# (Base64 data-URI images in <img src="data:..."> are stripped or not
+# rendered by Gmail and many other clients — CID attachments are the
+# reliable, standard way to embed images in HTML email.)
 # ---------------------------------------------------------------------------
-def build_sparkline_b64(history):
-    """history: list of (label, value) ascending. Returns base64 PNG or None."""
+def build_sparkline_png(history):
+    """history: list of (label, value) ascending. Returns raw PNG bytes or None."""
     if not history or len(history) < 2:
         return None
     values = [v for _, v in history]
@@ -258,7 +261,7 @@ def build_sparkline_b64(history):
     fig.savefig(buf, format="png", transparent=True)
     plt.close(fig)
     buf.seek(0)
-    return base64.b64encode(buf.read()).decode("ascii")
+    return buf.read()
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +284,7 @@ def fmt_change(change, pct, resolution="daily"):
 def build_html(results, inventory, data_quality):
     eastern = ZoneInfo("America/New_York")
     today = datetime.now(eastern).strftime("%A, %B %d, %Y")
+    chart_images = {}  # cid -> png bytes, returned alongside the HTML
 
     quality_warning = ""
     if data_quality < 1.0:
@@ -301,8 +305,12 @@ def build_html(results, inventory, data_quality):
         if not r:
             tier1_rows += f'<tr><td style="padding:8px;">{c["name"]}</td><td colspan="3" style="padding:8px;color:#888;">data unavailable</td></tr>'
             continue
-        chart_b64 = build_sparkline_b64(r.get("history", []))
-        chart_cell = f'<img src="data:image/png;base64,{chart_b64}" width="90" height="24" alt="trend" />' if chart_b64 else ""
+        png_bytes = build_sparkline_png(r.get("history", []))
+        chart_cell = ""
+        if png_bytes:
+            cid = f"chart_{c['name'].lower().replace(' ', '_')}"
+            chart_images[cid] = png_bytes
+            chart_cell = f'<img src="cid:{cid}" width="90" height="24" alt="trend" />'
         tier1_rows += (
             f'<tr>'
             f'<td style="padding:8px;font-weight:600;">{c["name"]}</td>'
@@ -377,23 +385,35 @@ def build_html(results, inventory, data_quality):
     </body>
     </html>
     """
-    return html
+    return html, chart_images
 
 
 # ---------------------------------------------------------------------------
 # Send
 # ---------------------------------------------------------------------------
-def send_email(html_body, dry_run=False):
+def send_email(html_body, chart_images=None, dry_run=False):
     if dry_run:
         logger.info("DRY RUN MODE: Email preview (not sending):")
         logger.info(html_body)
+        logger.info(f"Would attach {len(chart_images or {})} chart image(s): {list((chart_images or {}).keys())}")
         return
 
-    msg = MIMEMultipart("alternative")
+    # multipart/related wraps the alternative body + inline images, so mail
+    # clients that support CID references (Gmail included) render the charts.
+    msg = MIMEMultipart("related")
     msg["Subject"] = f"Commodities Report — {datetime.now().strftime('%b %d, %Y')}"
     msg["From"] = os.environ["REPORT_FROM_EMAIL"]
     msg["To"] = os.environ["REPORT_TO_EMAIL"]
-    msg.attach(MIMEText(html_body, "html"))
+
+    alt_part = MIMEMultipart("alternative")
+    alt_part.attach(MIMEText(html_body, "html"))
+    msg.attach(alt_part)
+
+    for cid, png_bytes in (chart_images or {}).items():
+        img = MIMEImage(png_bytes, "png")
+        img.add_header("Content-ID", f"<{cid}>")
+        img.add_header("Content-Disposition", "inline", filename=f"{cid}.png")
+        msg.attach(img)
 
     host = os.environ["SMTP_HOST"]
     port = int(os.environ.get("SMTP_PORT", 587))
@@ -450,8 +470,8 @@ def main(dry_run=False):
     except Exception as e:
         logger.warning(f"Inventory fetch failed (non-fatal): {e}")
 
-    html = build_html(results, inventory, data_quality)
-    send_email(html, dry_run=dry_run)
+    html, chart_images = build_html(results, inventory, data_quality)
+    send_email(html, chart_images=chart_images, dry_run=dry_run)
 
 
 if __name__ == "__main__":
