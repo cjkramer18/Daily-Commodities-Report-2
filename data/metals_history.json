@@ -2504,19 +2504,25 @@
   "2026-10-12": {
     "gold": 4171.65,
     "palladium": 1139.314,
-    "platinum": 1691.8,
+    "platinum": 1689.7,
     "silver": 60.321
   },
   "2026-10-13": {
     "gold": 4160.785,
     "palladium": 1123.886,
-    "platinum": 1664,
+    "platinum": 1663.6,
     "silver": 59.173
   },
   "2026-10-14": {
     "gold": 4104.795,
     "palladium": 1091.602,
-    "platinum": 1601,
+    "platinum": 1600.6,
     "silver": 55.6355
+  },
+  "2026-10-15": {
+    "gold": 4170.695,
+    "palladium": 1129.965,
+    "platinum": 1627.7,
+    "silver": 57.415
   }
 }
